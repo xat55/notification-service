@@ -8,7 +8,8 @@
         "laravel/framework": "^10.10",
         "laravel/tinker": "^2.9",
         "vladimir-yuldashev/laravel-queue-rabbitmq": "^14.0",
-        "predis/predis": "^2.2"
+        "predis/predis": "^2.2",
+        "darkaonline/l5-swagger": "^8.6"
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",

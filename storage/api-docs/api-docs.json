@@ -1,0 +1,278 @@
+{
+    "openapi": "3.0.0",
+    "info": {
+        "title": "Notification Service API",
+        "description": "Сервис массовых уведомлений с приоритезацией",
+        "contact": {
+            "email": "admin@example.com"
+        },
+        "version": "1.0.0"
+    },
+    "servers": [
+        {
+            "url": "http://my-default-host.com",
+            "description": "API Server"
+        }
+    ],
+    "paths": {
+        "/api/notifications/send": {
+            "post": {
+                "tags": [
+                    "Notifications"
+                ],
+                "summary": "Отправить массовое уведомление",
+                "operationId": "8150b86a4319b643457364e9a4d462a5",
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/SendNotificationRequest"
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "202": {
+                        "description": "Уведомления поставлены в очередь",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/SendNotificationResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Ошибка валидации",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ErrorResponse"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/subscribers/{subscriberId}/notifications": {
+            "get": {
+                "tags": [
+                    "Subscribers"
+                ],
+                "summary": "История уведомлений подписчика",
+                "operationId": "fc558932fdeb239a82a1be609cb78b1c",
+                "parameters": [
+                    {
+                        "name": "subscriberId",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Список уведомлений",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HistoryResponse"
+                                }
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Подписчик не найден",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ErrorResponse"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "components": {
+        "schemas": {
+            "Notification": {
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "example": "a1cb9993-5bcd-460b-ace0-556f6a276a62"
+                    },
+                    "subscriber_id": {
+                        "type": "string",
+                        "example": "user123"
+                    },
+                    "channel": {
+                        "type": "string",
+                        "enum": [
+                            "sms",
+                            "email"
+                        ],
+                        "example": "sms"
+                    },
+                    "message": {
+                        "type": "string",
+                        "example": "Hello from API!"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": [
+                            "high",
+                            "low"
+                        ],
+                        "example": "high"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "queued",
+                            "sent",
+                            "delivered",
+                            "failed"
+                        ],
+                        "example": "delivered"
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "example": "unique-key-123"
+                    },
+                    "error_message": {
+                        "type": "string",
+                        "nullable": true
+                    },
+                    "retry_count": {
+                        "type": "integer",
+                        "example": 0
+                    },
+                    "queued_at": {
+                        "type": "string",
+                        "format": "date-time"
+                    },
+                    "sent_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "nullable": true
+                    },
+                    "delivered_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "nullable": true
+                    },
+                    "created_at": {
+                        "type": "string",
+                        "format": "date-time"
+                    },
+                    "updated_at": {
+                        "type": "string",
+                        "format": "date-time"
+                    }
+                },
+                "type": "object"
+            },
+            "SendNotificationRequest": {
+                "required": [
+                    "channel",
+                    "message",
+                    "recipient_ids"
+                ],
+                "properties": {
+                    "channel": {
+                        "description": "Канал доставки",
+                        "type": "string",
+                        "enum": [
+                            "sms",
+                            "email"
+                        ]
+                    },
+                    "message": {
+                        "description": "Текст сообщения",
+                        "type": "string",
+                        "maxLength": 1000
+                    },
+                    "recipient_ids": {
+                        "description": "Массив ID получателей",
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "priority": {
+                        "description": "Приоритет",
+                        "type": "string",
+                        "enum": [
+                            "high",
+                            "low"
+                        ],
+                        "example": "low"
+                    },
+                    "idempotency_key": {
+                        "description": "Ключ идемпотентности",
+                        "type": "string",
+                        "example": "unique-key-123"
+                    }
+                },
+                "type": "object"
+            },
+            "SendNotificationResponse": {
+                "properties": {
+                    "batch_id": {
+                        "description": "ID пачки отправки",
+                        "type": "string",
+                        "format": "uuid"
+                    },
+                    "message": {
+                        "type": "string",
+                        "example": "Notifications queued successfully"
+                    }
+                },
+                "type": "object"
+            },
+            "HistoryResponse": {
+                "properties": {
+                    "subscriber_id": {
+                        "description": "ID подписчика",
+                        "type": "string"
+                    },
+                    "notifications": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/Notification"
+                        }
+                    }
+                },
+                "type": "object"
+            },
+            "ErrorResponse": {
+                "properties": {
+                    "message": {
+                        "type": "string"
+                    },
+                    "errors": {
+                        "type": "object",
+                        "additionalProperties": true
+                    }
+                },
+                "type": "object"
+            }
+        }
+    },
+    "tags": [
+        {
+            "name": "Notifications",
+            "description": "Отправка и управление уведомлениями"
+        },
+        {
+            "name": "Subscribers",
+            "description": "Информация о подписчиках"
+        }
+    ]
+}
