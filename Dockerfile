@@ -16,13 +16,18 @@ RUN pecl install redis && docker-php-ext-enable redis
 
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 
+# Создаем пользователя с UID 1000 (совпадает с хостовой системой)
+RUN groupadd -g 1000 www
+RUN useradd -u 1000 -ms /bin/bash -g www www
+
 WORKDIR /var/www
 
-COPY . .
+COPY --chown=www:www . .
 
 RUN composer install --no-interaction --optimize-autoloader
 
-RUN chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache
+# Убеждаемся, что все необходимые каталоги имеют правильного владельца
+RUN chown -R www:www /var/www/storage /var/www/bootstrap/cache /var/www/bootstrap/cache/*
 RUN chmod -R 775 /var/www/storage /var/www/bootstrap/cache
 
 EXPOSE 9000
