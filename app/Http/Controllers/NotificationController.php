@@ -14,12 +14,14 @@ class NotificationController extends Controller
 
     public function send(SendNotificationRequest $request): JsonResponse
     {
+        $validated = $request->validated();
+
         $result = $this->notificationService->sendBulk(
-            channel: $request->input('channel'),
-            message: $request->input('message'),
-            recipientIds: $request->input('recipient_ids'),
-            priority: $request->input('priority', 'low'),
-            idempotencyKey: $request->input('idempotency_key')
+            channel: $validated['channel'],
+            message: $validated['message'],
+            recipientIds: $validated['recipient_ids'],
+            priority: $validated['priority'] ?? 'low',
+            idempotencyKey: $validated['idempotency_key'] ?? null
         );
 
         return response()->json([
