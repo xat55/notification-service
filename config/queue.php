@@ -33,6 +33,7 @@ return [
             'login' => env('RABBITMQ_USER', 'guest'),
             'password' => env('RABBITMQ_PASSWORD', 'guest'),
             'queue' => env('RABBITMQ_QUEUE', 'default'),
+            'after_commit' => true,
             'exchange' => [
                 'name' => 'notifications',
                 'type' => 'direct',

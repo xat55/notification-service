@@ -7,7 +7,8 @@ use App\Jobs\SendNotificationJob;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\Log;
+use Throwable;
 
 class NotificationService
 {
@@ -24,21 +25,20 @@ class NotificationService
         $queueName = $priority === "high" ? "high_priority" : "marketing";
         $now = now();
 
-        $newRecords = [];
+        $records = [];
         $skippedCount = 0;
 
         foreach ($recipientIds as $recipientId) {
             $key = $idempotencyKey ?? $batchId . ":" . $recipientId;
             $redisKey = "idempotent:{$key}";
 
-            $acquired = Redis::set($redisKey, "1", "EX", self::IDEMPOTENCY_TTL, "NX");
-
-            if (!$acquired) {
+            // Быстрый путь: ключ уже обработан ранее → пропускаем без обращения к БД.
+            if (Redis::get($redisKey)) {
                 $skippedCount++;
                 continue;
             }
 
-            $newRecords[] = [
+            $records[] = [
                 "id" => (string) Str::uuid(),
                 "subscriber_id" => $recipientId,
                 "channel" => $channel,
@@ -52,86 +52,60 @@ class NotificationService
             ];
         }
 
-        if (empty($newRecords)) {
+        if (empty($records)) {
             return ["batch_id" => $batchId, "skipped" => $skippedCount];
         }
 
-        $insertedIds = [];
+        // БД — единственный источник правды для идемпотентности:
+        // дубли отсекает unique-индекс (ON CONFLICT DO NOTHING) атомарно,
+        // Redis-маркер ниже — лишь кэш, который ставится ТОЛЬКО после успешной
+        // вставки. Поэтому «зависших» ключей без записей в БД не бывает.
+        $inserted = []; // idempotency_key => id
 
-        try {
-            DB::transaction(function () use (&$insertedIds, $newRecords, $batchId, $queueName) {
-                $chunks = array_chunk($newRecords, 100);
+        DB::transaction(function () use (&$inserted, &$skippedCount, $records, $batchId, $queueName) {
+            foreach (array_chunk($records, 100) as $chunk) {
+                DB::table("notifications")->insertOrIgnore($chunk);
 
-                foreach ($chunks as $chunk) {
-                    DB::table("notifications")->insert($chunk);
+                // Только строки, вставленные этим запросом (id генерируем сами,
+                // чужие UUID сюда не попадут).
+                $ours = Notification::whereIn("id", array_column($chunk, "id"))
+                    ->pluck("id", "idempotency_key");
 
-                    $keys = array_column($chunk, "idempotency_key");
-                    $dbRecords = Notification::whereIn("idempotency_key", $keys)
-                        ->pluck("id", "idempotency_key");
-
-                    foreach ($keys as $key) {
-                        if ($dbRecords->has($key)) {
-                            $notificationId = $dbRecords->get($key);
-                            $insertedIds[] = $notificationId;
-                            Redis::sadd("batch:{$batchId}:ids", $notificationId);
-                            SendNotificationJob::dispatch($notificationId, $queueName);
-                        }
-                    }
+                foreach ($ours as $key => $notificationId) {
+                    $inserted[$key] = $notificationId;
                 }
 
-                Redis::expire("batch:{$batchId}:ids", 3600);
-            });
-        } catch (QueryException $e) {
-            if ($this->isUniqueViolation($e)) {
-                $existingKeys = Notification::whereIn(
-                    "idempotency_key",
-                    array_column($newRecords, "idempotency_key")
-                )->pluck("idempotency_key")->toArray();
-
-                $retryRecords = array_filter($newRecords, function ($record) use ($existingKeys) {
-                    return !in_array($record["idempotency_key"], $existingKeys);
-                });
-
-                if (!empty($retryRecords)) {
-                    DB::transaction(function () use (&$insertedIds, $retryRecords, $batchId, $queueName) {
-                        DB::table("notifications")->insert($retryRecords);
-
-                        $keys = array_column($retryRecords, "idempotency_key");
-                        $dbRecords = Notification::whereIn("idempotency_key", $keys)
-                            ->pluck("id", "idempotency_key");
-
-                        foreach ($keys as $key) {
-                            if ($dbRecords->has($key)) {
-                                $notificationId = $dbRecords->get($key);
-                                $insertedIds[] = $notificationId;
-                                Redis::sadd("batch:{$batchId}:ids", $notificationId);
-                                SendNotificationJob::dispatch($notificationId, $queueName);
-                            }
-                        }
-
-                        Redis::expire("batch:{$batchId}:ids", 3600);
-                    });
-                }
-            } else {
-                throw $e;
+                // Строки, не вставленные из-за конфликта по ключу, считаем пропущенными.
+                $skippedCount += count($chunk) - count($ours);
             }
-        }
+
+            // Redis-маркеры, батч-сет и джобы — только ПОСЛЕ коммита:
+            // при откате транзакции этот колбэк не выполнится вовсе.
+            DB::afterCommit(function () use ($inserted, $batchId, $queueName) {
+                try {
+                    foreach ($inserted as $key => $notificationId) {
+                        Redis::set("idempotent:{$key}", "1", "EX", self::IDEMPOTENCY_TTL);
+                        Redis::sadd("batch:{$batchId}:ids", $notificationId);
+                        SendNotificationJob::dispatch($notificationId, $queueName);
+                    }
+
+                    Redis::expire("batch:{$batchId}:ids", 3600);
+                } catch (Throwable $e) {
+                    // Записи уже закоммичены в БД; Redis/очередь — вспомогательные.
+                    // Не превращаем успешный коммит в 500: логируем для ручного разбора.
+                    Log::error("Post-commit notification bookkeeping failed", [
+                        "batch_id" => $batchId,
+                        "error" => $e->getMessage(),
+                    ]);
+                }
+            });
+        });
 
         return [
             "batch_id" => $batchId,
-            "created" => count($insertedIds),
+            "created" => count($inserted),
             "skipped" => $skippedCount,
         ];
-    }
-
-    /**
-     * Проверка на unique constraint violation для PostgreSQL.
-     */
-    private function isUniqueViolation(QueryException $e): bool
-    {
-        return $e->getCode() === "23505"
-            || str_contains($e->getMessage(), "unique")
-            || str_contains(strtolower($e->getMessage()), "duplicate");
     }
 
     public function getHistory(string $subscriberId): array

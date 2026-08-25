@@ -48,7 +48,7 @@ $queueName = $priority === "high" ? "high_priority" : "marketing";
 
 Очередь RabbitMQ выбирается по приоритету (не по каналу).
 
-**3.2. Идемпотентность через Redis (главная работа с Redis)**
+**3.2. Быстрый путь через Redis (проверка, не бронь)**
 
 Для **каждого получателя**:
 
@@ -56,58 +56,71 @@ $queueName = $priority === "high" ? "high_priority" : "marketing";
 $key      = $idempotencyKey ?? "{$batchId}:{$recipientId}";
 $redisKey = "idempotent:{$key}";
 
-$acquired = Redis::set($redisKey, "1", "EX", self::IDEMPOTENCY_TTL, "NX");
+// Быстрый путь: ключ уже обработан ранее → пропускаем без обращения к БД
+if (Redis::get($redisKey)) {
+    $skippedCount++;
+    continue;
+}
 ```
 
-Это атомарная команда `SET ... NX` + `EX` (TTL 24 часа):
+Redis-ключ `idempotent:{key}` — это **кэш-маркер** «ключ уже обработан», а не
+замок. Он ставится **только после успешной вставки в БД** (см. 3.3), поэтому
+«зависших» маркеров без записей не бывает: упала БД → маркер не ставился →
+повторный запрос пройдёт нормально. TTL — 24 часа.
 
-- `NX` — установить только если ключа ещё нет;
-- если вернулся `false` → ключ уже существует → получатель **пропускается**
-  (`$skippedCount++`);
-- если `true` → «бронь» занята, получатель попадает в `$newRecords[]` со
-  статусом `queued`.
-
-Redis здесь работает как **распределённый мьютекс/дедупликатор**: повторный
-запрос с тем же `idempotency_key` (или повторный получатель в том же батче)
-отсекается ещё до обращения к БД. Ключ никогда не удаляется вручную — живёт 24
-часа (TTL).
-
-**3.3. Запись в БД + повторная работа с Redis**
+**3.3. Запись в БД: БД — источник правды, дубли отсекает unique-индекс**
 
 ```php
 DB::transaction(function () use (...) {
-    foreach (array_chunk($newRecords, 100) as $chunk) {
-        DB::table("notifications")->insert($chunk);
+    foreach (array_chunk($records, 100) as $chunk) {
+        DB::table("notifications")->insertOrIgnore($chunk);  // ON CONFLICT DO NOTHING
 
-        // вытащить id вставленных записей по idempotency_key
-        $dbRecords = Notification::whereIn("idempotency_key", $keys)->pluck("id", "idempotency_key");
+        // только строки, вставленные этим запросом (id генерируем сами)
+        $ours = Notification::whereIn("id", array_column($chunk, "id"))
+            ->pluck("id", "idempotency_key");
 
-        foreach ($keys as $key) {
-            Redis::sadd("batch:{$batchId}:ids", $notificationId);   // ← Redis Set: члены батча
-            SendNotificationJob::dispatch($notificationId, $queueName); // ← RabbitMQ
+        foreach ($ours as $key => $notificationId) {
+            $inserted[$key] = $notificationId;
         }
+
+        // строки, не вставленные из-за конфликта по ключу → пропущены
+        $skippedCount += count($chunk) - count($ours);
     }
-    Redis::expire("batch:{$batchId}:ids", 3600);   // TTL на set батча, чтобы не копить мусор
+
+    // Redis-маркеры, батч-сет и джобы — только ПОСЛЕ коммита
+    DB::afterCommit(function () use ($inserted, $batchId, $queueName) {
+        foreach ($inserted as $key => $notificationId) {
+            Redis::set("idempotent:{$key}", "1", "EX", self::IDEMPOTENCY_TTL);
+            Redis::sadd("batch:{$batchId}:ids", $notificationId);
+            SendNotificationJob::dispatch($notificationId, $queueName);
+        }
+        Redis::expire("batch:{$batchId}:ids", 3600);
+    });
 });
 ```
 
-- `batch:{batchId}:ids` — Redis **Set**, в который складываются id всех
-  уведомлений батча (для отслеживания прогресса/отчётности), с TTL 1 час.
-- Джобы уходят в RabbitMQ (`QUEUE_CONNECTION=rabbitmq`, exchange `notifications`,
-  direct).
+- `insertOrIgnore` генерирует `INSERT ... ON CONFLICT DO NOTHING` — дубли
+  отсекаются **атомарно** на уровне unique-индекса `idempotency_key`, без
+  исключений и без гонок.
+- Всё посторитое с Redis (маркеры, `SADD`, dispatch) выполняется в
+  `DB::afterCommit()`: если транзакция откатится — ничего из этого не
+  произойдёт. Так закрывается dual-write между Redis и БД.
+- Джобы дополнительно защищены `after_commit => true` в конфиге rabbitmq
+  (`config/queue.php`).
 
-**3.4. Fallback на гонку (снова Redis + БД)**
+**3.4. Отдельной ветки на гонку больше нет**
 
-Если параллельный запрос успел вставить тот же `idempotency_key` между проверкой
-Redis и INSERT, Postgres кидает `QueryException` с кодом `23505` (unique index на
-`idempotency_key`). Тогда:
+Раньше при `QueryException` с кодом `23505` была recovery-ветка с повторной
+вставкой недостающих записей. Теперь она не нужна: `ON CONFLICT DO NOTHING` не
+бросает исключений — конфликт просто пропускается и учитывается в `skipped`.
 
-- выясняется, какие ключи уже есть в БД;
-- вставляются только «новые» записи в новой транзакции;
-- для них повторяется `Redis::sadd` + dispatch + `expire`.
+Схема идемпотентности теперь одноуровневая и транзакционная:
 
-Т.е. **БД — финальная защита**, Redis — быстрый фильтр первого уровня
-(двухуровневая идемпотентность).
+```
+Redis::get (fast-path, кэш) → miss → INSERT ... ON CONFLICT DO NOTHING (БД, атомарно)
+                                  ↑ дубль отсекается здесь, без исключений
+→ успешно вставленные → Redis-маркер + SADD + dispatch (только после коммита)
+```
 
 ### Шаг 4. Фоновая обработка — `SendNotificationJob` (в worker'е, RabbitMQ)
 
@@ -137,7 +150,7 @@ Redis::pipeline(function ($pipe) use ($dlqEntry) {
 
 | Ключ | Тип | Команды | Назначение |
 |---|---|---|---|
-| `idempotent:{key}` | string | `SET NX EX` | Дедупликация запросов (бронь на 24 ч) |
+| `idempotent:{key}` | string | `GET` (fast-path), `SET EX` (маркер после вставки) | Дедупликация запросов (маркер на 24 ч) |
 | `batch:{batchId}:ids` | set | `SADD`, `EXPIRE` | Трекинг членов батча (TTL 1 ч) |
 | `dlq:notifications` | list | `LPUSH`, `LTRIM`, `LLEN` | Dead-letter очередь неудавшихся уведомлений |
 
@@ -148,12 +161,16 @@ Redis::pipeline(function ($pipe) use ($dlqEntry) {
 
 **Важные нюансы архитектуры:**
 
-1. Redis-броня идемпотентности ставится **до** вставки в БД и не снимается после
-   успеха — повторный вызов с тем же ключом всегда вернёт 202 с пустым батчем
-   (получатели будут в `skipped`).
-2. Роль БД — `unique` индекс на `idempotency_key` — закрывает гонку между
-   проверкой Redis и INSERT.
-3. Батч-ключи `batch:*` и DLQ имеют TTL/лимиты, так что Redis не засоряется
+1. Идемпотентность решается **на уровне БД** (unique-индекс + `ON CONFLICT DO
+   NOTHING`) — атомарно и транзакционно. Redis-маркер `idempotent:{key}` — лишь
+   кэш-fast-path, он ставится только после успешной вставки, поэтому маркер без
+   записи существовать не может.
+2. Маркеры живут 24 часа (TTL) и не снимаются после успеха — повторный вызов с
+   тем же ключом вернёт 202 с `created=0`.
+3. Redis-записи (`SET`, `SADD`, `EXPIRE`) и dispatch джобов выполняются в
+   `DB::afterCommit()` (плюс `after_commit => true` для rabbitmq) — при откате
+   транзакции ничего из этого не происходит.
+4. Батч-ключи `batch:*` и DLQ имеют TTL/лимиты, так что Redis не засоряется
    бесконечно.
 
 ---
@@ -165,35 +182,34 @@ Redis::pipeline(function ($pipe) use ($dlqEntry) {
 **Генерируемая Redis-команда:**
 
 ```
-SET idempotent:{key} 1 EX 86400 NX
+SET idempotent:{key} 1 EX 86400
 ```
 
-**Что делает:** атомарно (в один шаг) записывает ключ только при условии, что его
-ещё нет, и одновременно ставит TTL.
+**Что делает:** записывает ключ с TTL (24 часа). Используется как **маркер**
+«этот idempotency_key уже обработан», а не как замок: он ставится **только
+после** успешной вставки записи в БД (в `DB::afterCommit`).
 
-- `EX 86400` — время жизни ключа 24 часа;
-- `NX` (Not eXists) — записать только если ключ отсутствует;
-- «атомарно» — между проверкой «есть ли ключ» и записью не может вклиниться
-  другой запрос (нет гонки).
+**Возвращает:** `true` при успешной записи, `false` при ошибке.
 
-**Возвращает:** `true`/`1`, если ключ записан, `false`/`null`/`0`, если ключ уже
-существовал.
-
-**В контексте проекта** — «замок идемпотентности» на каждого получателя:
+**В контексте проекта** — маркер на каждого получателя:
 
 ```php
-$acquired = Redis::set($redisKey, "1", "EX", self::IDEMPOTENCY_TTL, "NX");
-if (!$acquired) { $skippedCount++; continue; }
+// fast-path при новом запросе:
+if (Redis::get($redisKey)) { $skippedCount++; continue; }
+
+// ...после успешной вставки в БД (в afterCommit):
+Redis::set($redisKey, "1", "EX", self::IDEMPOTENCY_TTL);
 ```
 
-- первый запрос с ключом `user1` → ключ записан, `$acquired = true` → уведомление
-  создаётся;
-- повторный запрос с тем же ключом → `SET ... NX` не сработает, `$acquired =
-  false` → получатель пропускается, дубль не создаётся;
+- первый запрос с ключом `user1` → вставка в БД прошла → маркер записан;
+- повторный запрос с тем же ключом → `Redis::get` вернул `1` → получатель
+  пропускается, дубль не создаётся (даже если бы fast-path промахнулся, дубль
+  отсечёт unique-индекс БД);
 - через 24 часа ключ сам исчезнет, и тот же ключ снова можно будет использовать.
 
-⚠️ Нюанс: если `SET NX` прошёл, но потом вставка в БД упала с ошибкой, отличной
-от unique violation, ключ останется «забронированным» до истечения TTL.
+⚠️ Если Redis упал в момент `afterCommit` — маркер не поставится, но запись в БД
+уже есть; повторный запрос просто попадёт в `ON CONFLICT DO NOTHING` и будет
+корректно пропущен (расхождение закрывает БД).
 
 ### 2. `Redis::sadd("batch:{$batchId}:ids", $notificationId)`
 
@@ -297,7 +313,7 @@ Log::info("Notification pushed to DLQ", [
 
 | Вызов | Команда Redis | Тип данных | Возврат | Роль в проекте |
 |---|---|---|---|---|
-| `Redis::set(...,"EX",...,"NX")` | `SET ... NX EX` | string | `true`/`false` | замок идемпотентности (дедупликация, TTL 24 ч) |
+| `Redis::get(...)` / `Redis::set(...,"EX",...)` | `GET` / `SET EX` | string | `1`/`null` | fast-path проверка + маркер идемпотентности (TTL 24 ч, ставится после вставки в БД) |
 | `Redis::sadd(...)` | `SADD` | set | 1/0 | реестр id батча |
 | `Redis::expire(...,3600)` | `EXPIRE` | — | 1/0 | TTL для set батча |
 | `Redis::pipeline` | пакет команд | — | массив результатов | атомарная группировка LPUSH+LTRIM |
