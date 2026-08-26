@@ -26,6 +26,8 @@ class NotificationController extends Controller
 
         return response()->json([
             'batch_id' => $result['batch_id'],
+            'created' => $result['created'] ?? 0,
+            'skipped' => $result['skipped'] ?? 0,
             'message' => 'Notifications queued successfully'
         ], 202);
     }

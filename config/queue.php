@@ -34,14 +34,6 @@ return [
             'password' => env('RABBITMQ_PASSWORD', 'guest'),
             'queue' => env('RABBITMQ_QUEUE', 'default'),
             'after_commit' => true,
-            'exchange' => [
-                'name' => 'notifications',
-                'type' => 'direct',
-                'passive' => false,
-                'durable' => true,
-                'auto_delete' => false,
-            ],
-            'queue_declare_bind' => true,
             'ssl_params' => [],
             'options' => [
                 'ssl_options' => [],

@@ -29,7 +29,10 @@ class NotificationService
         $skippedCount = 0;
 
         foreach ($recipientIds as $recipientId) {
-            $key = $idempotencyKey ?? $batchId . ":" . $recipientId;
+            // Ключ всегда уникален для пары «запрос + получатель»:
+            // при явном idempotency_key без суффикса получателя unique-индекс БД
+            // пропускал бы всех получателей, кроме первого.
+            $key = ($idempotencyKey ?? $batchId) . ":" . $recipientId;
             $redisKey = "idempotent:{$key}";
 
             // Быстрый путь: ключ уже обработан ранее → пропускаем без обращения к БД.
@@ -84,9 +87,12 @@ class NotificationService
             DB::afterCommit(function () use ($inserted, $batchId, $queueName) {
                 try {
                     foreach ($inserted as $key => $notificationId) {
+                        // СНАЧАЛА отправляем джоб
+                        SendNotificationJob::dispatch($notificationId, $queueName);
+
+                        // ПОТОМ ставим Redis-маркер (только если джоб успешно отправлен)
                         Redis::set("idempotent:{$key}", "1", "EX", self::IDEMPOTENCY_TTL);
                         Redis::sadd("batch:{$batchId}:ids", $notificationId);
-                        SendNotificationJob::dispatch($notificationId, $queueName);
                     }
 
                     Redis::expire("batch:{$batchId}:ids", 3600);

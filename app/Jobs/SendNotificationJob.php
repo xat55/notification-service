@@ -45,9 +45,10 @@ class SendNotificationJob implements ShouldQueue
         }
 
         $result = $gateway->send(
-            $notification->channel,
-            $notification->subscriber_id,
-            $notification->message
+            channel: $notification->channel,
+            recipientId: $notification->subscriber_id,
+            message: $notification->message,
+            idempotencyKey: $notification->idempotency_key
         );
 
         if ($result["success"]) {
